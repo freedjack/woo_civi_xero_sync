@@ -21,6 +21,7 @@ $logs = get_option('wcxs_sync_logs', array());
         <a href="#settings" class="nav-tab nav-tab-active"><?php _e('Settings', 'woo-civi-xero-sync'); ?></a>
         <a href="#logs" class="nav-tab"><?php _e('Sync Logs', 'woo-civi-xero-sync'); ?></a>
         <a href="#test" class="nav-tab"><?php _e('Test Connection', 'woo-civi-xero-sync'); ?></a>
+        <a href="#debug" class="nav-tab"><?php _e('Debug', 'woo-civi-xero-sync'); ?></a>
     </div>
     
     <div id="settings" class="tab-content">
@@ -128,6 +129,27 @@ $logs = get_option('wcxs_sync_logs', array());
         
         <div id="test-result" style="margin-top: 20px;"></div>
     </div>
+    
+    <div id="debug" class="tab-content" style="display: none;">
+        <h2><?php _e('Debug Information', 'woo-civi-xero-sync'); ?></h2>
+        
+        <p><?php _e('This section helps troubleshoot CiviCRM Xero settings issues.', 'woo-civi-xero-sync'); ?></p>
+        
+        <button type="button" id="debug-settings" class="button button-secondary">
+            <?php _e('Debug Settings', 'woo-civi-xero-sync'); ?>
+        </button>
+        
+        <div id="debug-result" style="margin-top: 20px;"></div>
+        
+        <h3><?php _e('Manual Settings Check', 'woo-civi-xero-sync'); ?></h3>
+        <p><?php _e('You can also manually check your CiviCRM Xero settings:', 'woo-civi-xero-sync'); ?></p>
+        <ol>
+            <li><?php _e('Go to CiviCRM Admin > System Settings > Xero', 'woo-civi-xero-sync'); ?></li>
+            <li><?php _e('Verify that Xero Access Token and Tenant ID are configured', 'woo-civi-xero-sync'); ?></li>
+            <li><?php _e('Check that the CiviXero extension is properly installed and enabled', 'woo-civi-xero-sync'); ?></li>
+            <li><?php _e('Ensure the Xero API credentials are valid and not expired', 'woo-civi-xero-sync'); ?></li>
+        </ol>
+    </div>
 </div>
 
 <style>
@@ -229,7 +251,43 @@ jQuery(document).ready(function($) {
             complete: function() {
                 button.prop('disabled', false).text('<?php _e('Test Connection', 'woo-civi-xero-sync'); ?>');
             }
+                    });
+        });
+        
+        // Debug settings
+        $('#debug-settings').click(function() {
+            var button = $(this);
+            var resultDiv = $('#debug-result');
+            
+            button.prop('disabled', true).text('<?php _e('Debugging...', 'woo-civi-xero-sync'); ?>');
+            resultDiv.hide();
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'wcxs_debug_settings',
+                    nonce: '<?php echo wp_create_nonce('wcxs_debug_settings'); ?>'
+                },
+                success: function(response) {
+                    if (response.success) {
+                        var debugInfo = response.data;
+                        var html = '<div class="debug-info">';
+                        html += '<h4><?php _e('Debug Results:', 'woo-civi-xero-sync'); ?></h4>';
+                        html += '<pre>' + JSON.stringify(debugInfo, null, 2) + '</pre>';
+                        html += '</div>';
+                        resultDiv.html(html).show();
+                    } else {
+                        resultDiv.html('<div class="error"><strong><?php _e('Error!', 'woo-civi-xero-sync'); ?></strong> ' + response.data.message + '</div>').show();
+                    }
+                },
+                error: function() {
+                    resultDiv.html('<div class="error"><strong><?php _e('Error!', 'woo-civi-xero-sync'); ?></strong> <?php _e('Failed to debug settings.', 'woo-civi-xero-sync'); ?></div>').show();
+                },
+                complete: function() {
+                    button.prop('disabled', false).text('<?php _e('Debug Settings', 'woo-civi-xero-sync'); ?>');
+                }
+            });
         });
     });
-});
 </script>

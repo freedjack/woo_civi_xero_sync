@@ -74,6 +74,7 @@ class WooCiviXeroSync {
         // Add AJAX handlers
         add_action('wp_ajax_wcxs_test_connection', array($this, 'ajax_test_connection'));
         add_action('wp_ajax_wcxs_clear_logs', array($this, 'ajax_clear_logs'));
+        add_action('wp_ajax_wcxs_debug_settings', array($this, 'ajax_debug_settings'));
         
         // Add activation/deactivation hooks
         register_activation_hook(__FILE__, array($this, 'activate'));
@@ -184,7 +185,7 @@ class WooCiviXeroSync {
             
             // Create Xero API instance
             $this->xero_api = new Xero(
-                $settings['xero_access_token'],
+                $settings['xero_access_token']['access_token'],
                 $settings['xero_tenant_id']
             );
             
@@ -206,26 +207,32 @@ class WooCiviXeroSync {
                 civicrm_initialize();
             }
             
-            // Get settings using CiviCRM API
-            $result = civicrm_api3('Setting', 'get', array(
-                'sequential' => 1,
-                'return' => array(
-                    'xero_access_token',
-                    'xero_tenant_id',
-                    'xero_client_id',
-                    'xero_client_secret'
-                )
-            ));
+            // Use CiviXero's own settings class to get the correct settings
+            $settings = array();
             
-            if ($result['is_error']) {
-                throw new Exception('Failed to get CiviCRM settings: ' . $result['error_message']);
+            // Get basic settings
+            $settings['xero_client_id'] = \Civi::settings()->get('xero_client_id');
+            $settings['xero_client_secret'] = \Civi::settings()->get('xero_client_secret');
+            $settings['xero_tenant_id'] = \Civi::settings()->get('xero_tenant_id');
+            
+            // Get access token components (CiviXero stores them separately)
+            $access_token = \Civi::settings()->get('xero_access_token_access_token');
+            $refresh_token = \Civi::settings()->get('xero_access_token_refresh_token');
+            $expires = \Civi::settings()->get('xero_access_token_expires');
+            
+            // Construct the access token array as CiviXero expects it
+            if ($access_token && $refresh_token) {
+                $settings['xero_access_token'] = array(
+                    'access_token' => $access_token,
+                    'refresh_token' => $refresh_token,
+                    'expires' => $expires,
+                    'token_type' => 'Bearer',
+                );
             }
             
-            $settings = $result['values'][0] ?? array();
-            
-            // Check if required settings exist
+            // Check if we have the required settings
             if (empty($settings['xero_access_token']) || empty($settings['xero_tenant_id'])) {
-                throw new Exception('Xero credentials not configured in CiviCRM');
+                throw new Exception('Xero credentials not found in CiviCRM settings. Please ensure CiviXero is properly configured.');
             }
             
             return $settings;
@@ -523,6 +530,12 @@ class WooCiviXeroSync {
         }
         
         try {
+            // First, let's debug the settings
+            $settings = $this->get_civicrm_xero_settings();
+            if (!$settings) {
+                wp_send_json_error(array('message' => __('Failed to retrieve CiviCRM Xero settings. Check the error logs for details.', 'woo-civi-xero-sync')));
+            }
+            
             $xero_api = $this->get_xero_api();
             if (!$xero_api) {
                 wp_send_json_error(array('message' => __('Failed to initialize Xero API.', 'woo-civi-xero-sync')));
@@ -548,6 +561,69 @@ class WooCiviXeroSync {
     }
     
     /**
+     * Debug method to help troubleshoot settings issues
+     */
+    public function debug_settings() {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
+            }
+            
+            $debug_info = array();
+            
+            // Method 1: Direct CiviCRM settings access
+            $debug_info['method1'] = array(
+                'xero_client_id' => \Civi::settings()->get('xero_client_id') ? 'Set' : 'Not set',
+                'xero_client_secret' => \Civi::settings()->get('xero_client_secret') ? 'Set' : 'Not set',
+                'xero_tenant_id' => \Civi::settings()->get('xero_tenant_id') ? 'Set' : 'Not set',
+                'xero_access_token_access_token' => \Civi::settings()->get('xero_access_token_access_token') ? 'Set' : 'Not set',
+                'xero_access_token_refresh_token' => \Civi::settings()->get('xero_access_token_refresh_token') ? 'Set' : 'Not set',
+                'xero_access_token_expires' => \Civi::settings()->get('xero_access_token_expires') ? 'Set' : 'Not set',
+            );
+            
+            // Method 2: Try CiviCRM API
+            try {
+                $result = civicrm_api3('Setting', 'get', array(
+                    'sequential' => 1,
+                    'return' => array(
+                        'xero_client_id',
+                        'xero_client_secret', 
+                        'xero_tenant_id',
+                        'xero_access_token_access_token',
+                        'xero_access_token_refresh_token',
+                        'xero_access_token_expires'
+                    )
+                ));
+                $debug_info['method2'] = $result;
+            } catch (Exception $e) {
+                $debug_info['method2'] = 'Error: ' . $e->getMessage();
+            }
+            
+            // Method 3: Check if CiviXero settings class exists
+            try {
+                if (class_exists('CRM_Civixero_Settings')) {
+                    $civixero_settings = new CRM_Civixero_Settings(0);
+                    $debug_info['method3'] = array(
+                        'xero_client_id' => $civixero_settings->get('xero_client_id') ? 'Set' : 'Not set',
+                        'xero_tenant_id' => $civixero_settings->get('xero_tenant_id') ? 'Set' : 'Not set',
+                        'xero_access_token' => $civixero_settings->get('xero_access_token') ? 'Set' : 'Not set',
+                    );
+                } else {
+                    $debug_info['method3'] = 'CRM_Civixero_Settings class not found';
+                }
+            } catch (Exception $e) {
+                $debug_info['method3'] = 'Error: ' . $e->getMessage();
+            }
+            
+            return $debug_info;
+            
+        } catch (Exception $e) {
+            return array('error' => $e->getMessage());
+        }
+    }
+    
+    /**
      * AJAX handler for clearing logs
      */
     public function ajax_clear_logs() {
@@ -559,6 +635,24 @@ class WooCiviXeroSync {
         
         delete_option('wcxs_sync_logs');
         wp_send_json_success(array('message' => __('Logs cleared successfully.', 'woo-civi-xero-sync')));
+    }
+    
+    /**
+     * AJAX handler for debugging settings
+     */
+    public function ajax_debug_settings() {
+        check_ajax_referer('wcxs_debug_settings', 'nonce');
+        
+        if (!current_user_can('manage_woocommerce')) {
+            wp_die(__('You do not have permission to perform this action.', 'woo-civi-xero-sync'));
+        }
+        
+        try {
+            $debug_info = $this->debug_settings();
+            wp_send_json_success($debug_info);
+        } catch (Exception $e) {
+            wp_send_json_error(array('message' => $e->getMessage()));
+        }
     }
     
     /**

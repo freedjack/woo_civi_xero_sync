@@ -148,10 +148,18 @@ class WooCiviXeroSync {
                 // Update existing contact
                 $this->update_xero_contact($xero_api, $existing_contact['ContactID'], $contact_data);
                 $this->log_sync('Contact updated in Xero', $order->get_id(), $existing_contact['ContactID']);
+                
+                // Update account_contact table if contact was found there
+                if (isset($existing_contact['found_in_account_table'])) {
+                    $this->update_account_contact_table($existing_contact['ContactID'], $order->get_id());
+                }
             } else {
                 // Create new contact
                 $new_contact = $this->create_xero_contact($xero_api, $contact_data);
                 $this->log_sync('Contact created in Xero', $order->get_id(), $new_contact['ContactID']);
+                
+                // Add to account_contact table
+                $this->add_to_account_contact_table($new_contact['ContactID'], $order->get_id());
             }
             
         } catch (Exception $e) {
@@ -323,18 +331,28 @@ class WooCiviXeroSync {
                 civicrm_initialize();
             }
             
-            // Get CiviCRM contact by WordPress user ID
-            $result = civicrm_api3('UFMatch', 'get', array(
-                'sequential' => 1,
-                'uf_id' => $user_id,
-                'return' => array('contact_id')
-            ));
+            $contact_id = null;
             
-            if ($result['is_error'] || empty($result['values'])) {
-                return null;
+            // Use logged-in contact ID if not in admin area
+            if (!is_admin()) {
+                $contact_id = \CRM_Core_Session::singleton()->getLoggedInContactID();
             }
             
-            $contact_id = $result['values'][0]['contact_id'];
+            // Fallback to UFMatch if no logged-in contact or in admin area
+            if (!$contact_id) {
+                // Get CiviCRM contact by WordPress user ID
+                $result = civicrm_api3('UFMatch', 'get', array(
+                    'sequential' => 1,
+                    'uf_id' => $user_id,
+                    'return' => array('contact_id')
+                ));
+                
+                if ($result['is_error'] || empty($result['values'])) {
+                    return null;
+                }
+                
+                $contact_id = $result['values'][0]['contact_id'];
+            }
             
             // Get contact details
             $contact_result = civicrm_api3('Contact', 'get', array(
@@ -384,16 +402,29 @@ class WooCiviXeroSync {
                 return null;
             }
             
-            // Search for contact by email
-            $contacts = $xero_api->contacts(array('EmailAddress' => $email));
+            // First, try to find contact in civicrm_account_contact table
+            $existing_contact = $this->find_contact_in_account_table($email);
+            if ($existing_contact) {
+                return $existing_contact;
+            }
+            
+            // If not found in account table, search Xero API
+            // Use the correct API call format for searching contacts
+            $contacts = $xero_api->contacts();
             
             if (isset($contacts['Contacts']['Contact'])) {
-                $contact = $contacts['Contacts']['Contact'];
+                $contact_list = $contacts['Contacts']['Contact'];
                 // Handle single contact vs array of contacts
-                if (isset($contact[0])) {
-                    return $contact[0];
+                if (!isset($contact_list[0])) {
+                    $contact_list = array($contact_list);
                 }
-                return $contact;
+                
+                // Search through contacts for matching email
+                foreach ($contact_list as $contact) {
+                    if (isset($contact['EmailAddress']) && $contact['EmailAddress'] === $email) {
+                        return $contact;
+                    }
+                }
             }
             
             return null;
@@ -401,6 +432,166 @@ class WooCiviXeroSync {
         } catch (Exception $e) {
             $this->log_error('Failed to find existing contact: ' . $e->getMessage());
             return null;
+        }
+    }
+    
+    /**
+     * Find contact in civicrm_account_contact table
+     */
+    private function find_contact_in_account_table($email) {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
+            }
+            
+            // Get contact ID from email
+            $contact_result = civicrm_api3('Contact', 'get', array(
+                'sequential' => 1,
+                'email' => $email,
+                'return' => array('id')
+            ));
+            
+            if ($contact_result['is_error'] || empty($contact_result['values'])) {
+                return null;
+            }
+            
+            $contact_id = $contact_result['values'][0]['id'];
+            
+            // Check if contact exists in account_contact table
+            $account_contact_result = civicrm_api3('AccountContact', 'get', array(
+                'sequential' => 1,
+                'contact_id' => $contact_id,
+                'plugin' => 'xero',
+                'return' => array('accounts_contact_id')
+            ));
+            
+            if ($account_contact_result['is_error'] || empty($account_contact_result['values'])) {
+                return null;
+            }
+            
+            $account_contact = $account_contact_result['values'][0];
+            
+            // Return contact data in Xero format
+            return array(
+                'ContactID' => $account_contact['accounts_contact_id'],
+                'EmailAddress' => $email,
+                'found_in_account_table' => true
+            );
+            
+        } catch (Exception $e) {
+            $this->log_error('Failed to find contact in account table: ' . $e->getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Add contact to account_contact table
+     */
+    private function add_to_account_contact_table($xero_contact_id, $order_id) {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
+            }
+            
+            // Get CiviCRM contact ID from order
+            $order = wc_get_order($order_id);
+            $user_id = $order->get_user_id();
+            
+            if (!$user_id) {
+                return;
+            }
+            
+            $contact_id = null;
+            
+            // Use logged-in contact ID if not in admin area
+            if (!is_admin()) {
+                $contact_id = \CRM_Core_Session::singleton()->getLoggedInContactID();
+            }
+            
+            // Fallback to UFMatch if no logged-in contact or in admin area
+            if (!$contact_id) {
+                // Get CiviCRM contact ID
+                $ufmatch_result = civicrm_api3('UFMatch', 'get', array(
+                    'sequential' => 1,
+                    'uf_id' => $user_id,
+                    'return' => array('contact_id')
+                ));
+                
+                if ($ufmatch_result['is_error'] || empty($ufmatch_result['values'])) {
+                    return;
+                }
+                
+                $contact_id = $ufmatch_result['values'][0]['contact_id'];
+            }
+            
+            // Add to account_contact table
+            civicrm_api3('AccountContact', 'create', array(
+                'contact_id' => $contact_id,
+                'plugin' => 'xero',
+                'accounts_contact_id' => $xero_contact_id,
+                'accounts_needs_update' => 0,
+                'accounts_modified_date' => date('Y-m-d H:i:s')
+            ));
+            
+        } catch (Exception $e) {
+            $this->log_error('Failed to add contact to account table: ' . $e->getMessage(), $order_id);
+        }
+    }
+    
+    /**
+     * Update contact in account_contact table
+     */
+    private function update_account_contact_table($xero_contact_id, $order_id) {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
+            }
+            
+            // Get CiviCRM contact ID from order
+            $order = wc_get_order($order_id);
+            $user_id = $order->get_user_id();
+            
+            if (!$user_id) {
+                return;
+            }
+            
+            $contact_id = null;
+            
+            // Use logged-in contact ID if not in admin area
+            if (!is_admin()) {
+                $contact_id = \CRM_Core_Session::singleton()->getLoggedInContactID();
+            }
+            
+            // Fallback to UFMatch if no logged-in contact or in admin area
+            if (!$contact_id) {
+                // Get CiviCRM contact ID
+                $ufmatch_result = civicrm_api3('UFMatch', 'get', array(
+                    'sequential' => 1,
+                    'uf_id' => $user_id,
+                    'return' => array('contact_id')
+                ));
+                
+                if ($ufmatch_result['is_error'] || empty($ufmatch_result['values'])) {
+                    return;
+                }
+                
+                $contact_id = $ufmatch_result['values'][0]['contact_id'];
+            }
+            
+            // Update account_contact table
+            civicrm_api3('AccountContact', 'create', array(
+                'contact_id' => $contact_id,
+                'plugin' => 'xero',
+                'accounts_contact_id' => $xero_contact_id,
+                'accounts_needs_update' => 0,
+                'accounts_modified_date' => date('Y-m-d H:i:s')
+            ));
+            
+        } catch (Exception $e) {
+            $this->log_error('Failed to update contact in account table: ' . $e->getMessage(), $order_id);
         }
     }
     

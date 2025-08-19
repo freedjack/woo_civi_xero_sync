@@ -148,18 +148,10 @@ class WooCiviXeroSync {
                 // Update existing contact
                 $this->update_xero_contact($xero_api, $existing_contact['ContactID'], $contact_data);
                 $this->log_sync('Contact updated in Xero', $order->get_id(), $existing_contact['ContactID']);
-                
-                // Update account_contact table if contact was found there
-                if (isset($existing_contact['found_in_account_table'])) {
-                    $this->update_account_contact_table($existing_contact['ContactID'], $order->get_id());
-                }
             } else {
                 // Create new contact
                 $new_contact = $this->create_xero_contact($xero_api, $contact_data);
                 $this->log_sync('Contact created in Xero', $order->get_id(), $new_contact['ContactID']);
-                
-                // Add to account_contact table
-                $this->add_to_account_contact_table($new_contact['ContactID'], $order->get_id());
             }
             
         } catch (Exception $e) {
@@ -485,115 +477,7 @@ class WooCiviXeroSync {
         }
     }
     
-    /**
-     * Add contact to account_contact table
-     */
-    private function add_to_account_contact_table($xero_contact_id, $order_id) {
-        try {
-            // Initialize CiviCRM if needed
-            if (!defined('CIVICRM_UF')) {
-                civicrm_initialize();
-            }
-            
-            // Get CiviCRM contact ID from order
-            $order = wc_get_order($order_id);
-            $user_id = $order->get_user_id();
-            
-            if (!$user_id) {
-                return;
-            }
-            
-            $contact_id = null;
-            
-            // Use logged-in contact ID if not in admin area
-            if (!is_admin()) {
-                $contact_id = \CRM_Core_Session::singleton()->getLoggedInContactID();
-            }
-            
-            // Fallback to UFMatch if no logged-in contact or in admin area
-            if (!$contact_id) {
-                // Get CiviCRM contact ID
-                $ufmatch_result = civicrm_api3('UFMatch', 'get', array(
-                    'sequential' => 1,
-                    'uf_id' => $user_id,
-                    'return' => array('contact_id')
-                ));
-                
-                if ($ufmatch_result['is_error'] || empty($ufmatch_result['values'])) {
-                    return;
-                }
-                
-                $contact_id = $ufmatch_result['values'][0]['contact_id'];
-            }
-            
-            // Add to account_contact table
-            civicrm_api3('AccountContact', 'create', array(
-                'contact_id' => $contact_id,
-                'plugin' => 'xero',
-                'accounts_contact_id' => $xero_contact_id,
-                'accounts_needs_update' => 0,
-                'accounts_modified_date' => date('Y-m-d H:i:s')
-            ));
-            
-        } catch (Exception $e) {
-            $this->log_error('Failed to add contact to account table: ' . $e->getMessage(), $order_id);
-        }
-    }
-    
-    /**
-     * Update contact in account_contact table
-     */
-    private function update_account_contact_table($xero_contact_id, $order_id) {
-        try {
-            // Initialize CiviCRM if needed
-            if (!defined('CIVICRM_UF')) {
-                civicrm_initialize();
-            }
-            
-            // Get CiviCRM contact ID from order
-            $order = wc_get_order($order_id);
-            $user_id = $order->get_user_id();
-            
-            if (!$user_id) {
-                return;
-            }
-            
-            $contact_id = null;
-            
-            // Use logged-in contact ID if not in admin area
-            if (!is_admin()) {
-                $contact_id = \CRM_Core_Session::singleton()->getLoggedInContactID();
-            }
-            
-            // Fallback to UFMatch if no logged-in contact or in admin area
-            if (!$contact_id) {
-                // Get CiviCRM contact ID
-                $ufmatch_result = civicrm_api3('UFMatch', 'get', array(
-                    'sequential' => 1,
-                    'uf_id' => $user_id,
-                    'return' => array('contact_id')
-                ));
-                
-                if ($ufmatch_result['is_error'] || empty($ufmatch_result['values'])) {
-                    return;
-                }
-                
-                $contact_id = $ufmatch_result['values'][0]['contact_id'];
-            }
-            
-            // Update account_contact table
-            civicrm_api3('AccountContact', 'create', array(
-                'contact_id' => $contact_id,
-                'plugin' => 'xero',
-                'accounts_contact_id' => $xero_contact_id,
-                'accounts_needs_update' => 0,
-                'accounts_modified_date' => date('Y-m-d H:i:s')
-            ));
-            
-        } catch (Exception $e) {
-            $this->log_error('Failed to update contact in account table: ' . $e->getMessage(), $order_id);
-        }
-    }
+
     
     /**
      * Create new contact in Xero

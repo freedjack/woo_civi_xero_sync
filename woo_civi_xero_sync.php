@@ -23,6 +23,9 @@ define('WCXS_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('WCXS_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('WCXS_VERSION', '1.0.0');
 
+// Include utilities class
+require_once WCXS_PLUGIN_DIR . 'includes/class-wcxs-utilities.php';
+
 /**
  * Main plugin class
  */
@@ -75,6 +78,11 @@ class WooCiviXeroSync {
         add_action('wp_ajax_wcxs_test_connection', array($this, 'ajax_test_connection'));
         add_action('wp_ajax_wcxs_clear_logs', array($this, 'ajax_clear_logs'));
         add_action('wp_ajax_wcxs_debug_settings', array($this, 'ajax_debug_settings'));
+        add_action('wp_ajax_wcxs_debug_get_users', array($this, 'ajax_debug_get_users'));
+        add_action('wp_ajax_wcxs_debug_get_user_info', array($this, 'ajax_debug_get_user_info'));
+        add_action('wp_ajax_wcxs_debug_update_xero_contact', array($this, 'ajax_debug_update_xero_contact'));
+        add_action('wp_ajax_wcxs_get_invoice_details', array($this, 'ajax_get_invoice_details'));
+        add_action('wp_ajax_nopriv_wcxs_get_invoice_details', array($this, 'ajax_get_invoice_details'));
         
         // Add activation/deactivation hooks
         register_activation_hook(__FILE__, array($this, 'activate'));
@@ -131,182 +139,98 @@ class WooCiviXeroSync {
      * Sync WooCommerce order contact to Xero
      */
     public function sync_contact_to_xero($order) {
+        $order_id = $order->get_id();
+        $user_id = $order->get_user_id();
+        
+        WCXS_Utilities::log_sync("Starting sync for Order #{$order_id} (User ID: {$user_id})", $order_id);
+        
         try {
             // Get Xero API instance
-            $xero_api = $this->get_xero_api();
+            $xero_api = WCXS_Utilities::get_xero_api();
             if (!$xero_api) {
                 throw new Exception('Unable to initialize Xero API');
             }
+            WCXS_Utilities::log_sync("Xero API initialized successfully", $order_id);
             
-            // Prepare contact data
-            $contact_data = $this->prepare_contact_data($order);
+            // Get CiviCRM contact data for better matching
+            $civicrm_contact = $this->get_civicrm_contact($order);
+            if ($civicrm_contact) {
+                WCXS_Utilities::log_sync("Found CiviCRM contact: ID {$civicrm_contact['id']}, Name: {$civicrm_contact['first_name']} {$civicrm_contact['last_name']}", $order_id);
+            } else {
+                WCXS_Utilities::log_sync("No CiviCRM contact found for user ID {$user_id}", $order_id);
+            }
+            
+            // Prepare contact data with CiviCRM contact information
+            $contact_data = WCXS_Utilities::prepare_contact_data($order, $civicrm_contact);
+            WCXS_Utilities::log_sync("Prepared contact data: Name: {$contact_data['Name']}, Email: {$contact_data['EmailAddress']}, ContactNumber: {$contact_data['ContactNumber']}", $order_id);
             
             // Check if contact already exists in Xero
-            $existing_contact = $this->find_existing_contact($xero_api, $contact_data['EmailAddress']);
+            $contact_number = isset($contact_data['ContactNumber']) ? $contact_data['ContactNumber'] : null;
+            $existing_contact = $this->find_existing_contact($xero_api, $contact_data['EmailAddress'], $contact_number);
             
             if ($existing_contact) {
-                // Update existing contact
-                $this->update_xero_contact($xero_api, $existing_contact['ContactID'], $contact_data);
-                $this->log_sync('Contact updated in Xero', $order->get_id(), $existing_contact['ContactID']);
+                // Validate that the existing contact has a valid ContactID
+                if (empty($existing_contact['ContactID'])) {
+                    WCXS_Utilities::log_sync("Found existing contact but ContactID is empty, creating new contact", $order_id);
+                    
+                    // Create new contact since the existing one has no valid ID
+                    $new_contact = $this->create_xero_contact($xero_api, $contact_data);
+                    
+                    // Validate the new contact was created successfully
+                    if ($new_contact && isset($new_contact['ContactID']) && isset($new_contact['Name'])) {
+                        WCXS_Utilities::log_sync("Successfully created new Xero contact: ID {$new_contact['ContactID']}, Name: {$new_contact['Name']}", $order_id, $new_contact['ContactID']);
+                        
+                        // Update account_contact table with the new Xero contact ID
+                        if ($civicrm_contact && isset($civicrm_contact['id'])) {
+                            $this->update_account_contact_table($civicrm_contact['id'], $new_contact['ContactID'], $new_contact['Name']);
+                        }
+                    } else {
+                        WCXS_Utilities::log_error("Failed to create new Xero contact - invalid response", $order_id);
+                        throw new Exception("Failed to create new Xero contact - invalid response");
+                    }
+                } else {
+                    
+                    WCXS_Utilities::log_sync("Found existing Xero contact: ID {$existing_contact['ContactID']}, Name: {$existing_contact['EmailAddress']}", $order_id);
+                    
+                    // Update existing contact
+                    $this->update_xero_contact($xero_api, $existing_contact['ContactID'], $contact_data);
+                    WCXS_Utilities::log_sync("Successfully updated existing Xero contact: ID {$existing_contact['ContactID']}", $order_id, $existing_contact['ContactID']);
+                    
+                    // Check if this Xero contact is already in account_contact table, if not add it
+                    if ($civicrm_contact && isset($civicrm_contact['id'])) {
+                        $this->ensure_account_contact_exists($civicrm_contact['id'], $existing_contact['ContactID'], $existing_contact['EmailAddress']);
+                    }
+                }
             } else {
+                WCXS_Utilities::log_sync("No existing Xero contact found, creating new contact", $order_id);
+                
                 // Create new contact
                 $new_contact = $this->create_xero_contact($xero_api, $contact_data);
-                $this->log_sync('Contact created in Xero', $order->get_id(), $new_contact['ContactID']);
+                
+                // Validate the new contact was created successfully
+                if ($new_contact && isset($new_contact['ContactID']) && isset($new_contact['Name'])) {
+                    WCXS_Utilities::log_sync("Successfully created new Xero contact: ID {$new_contact['ContactID']}, Name: {$new_contact['Name']}", $order_id, $new_contact['ContactID']);
+                    
+                    // Update account_contact table with the new Xero contact ID
+                    if ($civicrm_contact && isset($civicrm_contact['id'])) {
+                        $this->update_account_contact_table($civicrm_contact['id'], $new_contact['ContactID'], $new_contact['Name']);
+                    }
+                } else {
+                    WCXS_Utilities::log_error("Failed to create new Xero contact - invalid response", $order_id);
+                    throw new Exception("Failed to create new Xero contact - invalid response");
+                }
             }
             
+            WCXS_Utilities::log_sync("Sync completed successfully for Order #{$order_id}", $order_id);
+            
         } catch (Exception $e) {
-            $this->log_error('Failed to sync contact to Xero: ' . $e->getMessage(), $order->get_id());
+            WCXS_Utilities::log_error("Failed to sync contact to Xero for Order #{$order_id}: " . $e->getMessage(), $order_id);
         }
     }
     
-    /**
-     * Get Xero API instance using CiviXero credentials
-     */
-    private function get_xero_api() {
-        if ($this->xero_api) {
-            return $this->xero_api;
-        }
-        
-        try {
-            // Get CiviCRM settings
-            $settings = $this->get_civicrm_xero_settings();
-            
-            if (!$settings) {
-                throw new Exception('CiviXero settings not found');
-            }
-            
-            // Include the Xero class from CiviXero extension
-            $civixero_path = WP_CONTENT_DIR . '/uploads/civicrm/ext/nz.co.fuzion.civixero/packages/Xero/Xero.php';
-            if (!file_exists($civixero_path)) {
-                throw new Exception('CiviXero Xero class not found at: ' . $civixero_path);
-            }
-            
-            require_once $civixero_path;
-            
-            // Create Xero API instance
-            $this->xero_api = new Xero(
-                $settings['xero_access_token']['access_token'],
-                $settings['xero_tenant_id']
-            );
-            
-            return $this->xero_api;
-            
-        } catch (Exception $e) {
-            $this->log_error('Failed to initialize Xero API: ' . $e->getMessage());
-            return null;
-        }
-    }
+
     
-    /**
-     * Get CiviCRM Xero settings
-     */
-    private function get_civicrm_xero_settings() {
-        try {
-            // Initialize CiviCRM if needed
-            if (!defined('CIVICRM_UF')) {
-                civicrm_initialize();
-            }
-            
-            // Use CiviXero's own settings class to get the correct settings
-            $settings = array();
-            
-            // Get basic settings
-            $settings['xero_client_id'] = \Civi::settings()->get('xero_client_id');
-            $settings['xero_client_secret'] = \Civi::settings()->get('xero_client_secret');
-            $settings['xero_tenant_id'] = \Civi::settings()->get('xero_tenant_id');
-            
-            // Get access token components (CiviXero stores them separately)
-            $access_token = \Civi::settings()->get('xero_access_token_access_token');
-            $refresh_token = \Civi::settings()->get('xero_access_token_refresh_token');
-            $expires = \Civi::settings()->get('xero_access_token_expires');
-            
-            // Construct the access token array as CiviXero expects it
-            if ($access_token && $refresh_token) {
-                $settings['xero_access_token'] = array(
-                    'access_token' => $access_token,
-                    'refresh_token' => $refresh_token,
-                    'expires' => $expires,
-                    'token_type' => 'Bearer',
-                );
-            }
-            
-            // Check if we have the required settings
-            if (empty($settings['xero_access_token']) || empty($settings['xero_tenant_id'])) {
-                throw new Exception('Xero credentials not found in CiviCRM settings. Please ensure CiviXero is properly configured.');
-            }
-            
-            return $settings;
-            
-        } catch (Exception $e) {
-            $this->log_error('Failed to get CiviCRM Xero settings: ' . $e->getMessage());
-            return null;
-        }
-    }
-    
-    /**
-     * Prepare contact data from WooCommerce order
-     */
-    private function prepare_contact_data($order) {
-        // Get CiviCRM contact using order user ID
-        $civicrm_contact = $this->get_civicrm_contact($order);
-        
-        // Get address with fallback logic
-        $address = $this->get_best_address($order);
-        
-        // Build contact name
-        $first_name = $address['first_name'] ?? '';
-        $last_name = $address['last_name'] ?? '';
-        $company = $address['company'] ?? '';
-        
-        if (!empty($company)) {
-            $name = $company;
-            if (!empty($first_name) || !empty($last_name)) {
-                $name .= ' - ' . trim($first_name . ' ' . $last_name);
-            }
-        } else {
-            $name = trim($first_name . ' ' . $last_name);
-        }
-        
-        // Add order ID to make name unique
-        $name .= ' - ' . $order->get_id();
-        
-        $contact_data = array(
-            'Name' => $name,
-            'FirstName' => $first_name,
-            'LastName' => $last_name,
-            'EmailAddress' => $address['email'] ?? '',
-            'ContactNumber' => $order->get_id(),
-        );
-        
-        // Add phone if available
-        if (!empty($address['phone'])) {
-            $contact_data['Phones'] = array(
-                'Phone' => array(
-                    'PhoneType' => 'DEFAULT',
-                    'PhoneNumber' => $address['phone']
-                )
-            );
-        }
-        
-        // Add address if available
-        if (!empty($address['address_1'])) {
-            $contact_data['Addresses'] = array(
-                'Address' => array(
-                    array(
-                        'AddressType' => 'POBOX', // Default mailing address for invoices
-                        'AddressLine1' => $address['address_1'] ?? '',
-                        'AddressLine2' => $address['address_2'] ?? '',
-                        'City' => $address['city'] ?? '',
-                        'PostalCode' => $address['postcode'] ?? '',
-                        'Country' => $address['country'] ?? '',
-                        'Region' => $address['state'] ?? '',
-                    )
-                )
-            );
-        }
-        
-        return $contact_data;
-    }
+
     
     /**
      * Get CiviCRM contact using order user ID
@@ -360,7 +284,7 @@ class WooCiviXeroSync {
             return $contact_result['values'][0] ?? null;
             
         } catch (Exception $e) {
-            $this->log_error('Failed to get CiviCRM contact: ' . $e->getMessage(), $order->get_id());
+            WCXS_Utilities::log_error('Failed to get CiviCRM contact: ' . $e->getMessage(), $order->get_id());
             return null;
         }
     }
@@ -386,23 +310,52 @@ class WooCiviXeroSync {
     }
     
     /**
-     * Find existing contact in Xero by email
+     * Find existing contact in Xero by email or contact number
      */
-    private function find_existing_contact($xero_api, $email) {
+    private function find_existing_contact($xero_api, $email, $contact_number = null) {
         try {
             if (empty($email)) {
+                WCXS_Utilities::log_sync("No email provided for contact search", null);
                 return null;
             }
+            
+            WCXS_Utilities::log_sync("Searching for existing contact with email: {$email}", null);
             
             // First, try to find contact in civicrm_account_contact table
             $existing_contact = $this->find_contact_in_account_table($email);
             if ($existing_contact) {
+                WCXS_Utilities::log_sync("Found contact in account table: Xero ID {$existing_contact['ContactID']}", null);
                 return $existing_contact;
             }
             
-            // If not found in account table, search Xero API
-            // Use the correct API call format for searching contacts
-            $contacts = $xero_api->contacts();
+            WCXS_Utilities::log_sync("Contact not found in account table, searching Xero API", null);
+            
+            // Try searching by contact number first (if available)
+            if ($contact_number) {
+                $where_clause = "ContactNumber==\"$contact_number\"";
+                $contacts = $xero_api->contacts(null, null, $where_clause);
+                
+                if (isset($contacts['Contacts']['Contact'])) {
+                    $contact_list = $contacts['Contacts']['Contact'];
+                    // Handle single contact vs array of contacts
+                    if (!isset($contact_list[0])) {
+                        $contact_list = array($contact_list);
+                    }
+                    
+                    WCXS_Utilities::log_sync("Retrieved " . count($contact_list) . " contacts from Xero API using contact number filter", null);
+                    
+                    // Should only be one contact with this contact number, return the first one
+                    if (!empty($contact_list)) {
+                        $contact = $contact_list[0];
+                        WCXS_Utilities::log_sync("Found matching contact in Xero API by contact number: ID {$contact['ContactID']}, Name: {$contact['Name']}", null);
+                        return $contact;
+                    }
+                }
+            }
+            
+            // If not found by contact number, search by email
+            $where_clause = "EmailAddress==\"$email\"";
+            $contacts = $xero_api->contacts(null, null, $where_clause);
             
             if (isset($contacts['Contacts']['Contact'])) {
                 $contact_list = $contacts['Contacts']['Contact'];
@@ -411,18 +364,24 @@ class WooCiviXeroSync {
                     $contact_list = array($contact_list);
                 }
                 
-                // Search through contacts for matching email
-                foreach ($contact_list as $contact) {
-                    if (isset($contact['EmailAddress']) && $contact['EmailAddress'] === $email) {
-                        return $contact;
-                    }
+                WCXS_Utilities::log_sync("Retrieved " . count($contact_list) . " contacts from Xero API using email filter", null);
+                
+                // Should only be one contact with this email, return the first one
+                if (!empty($contact_list)) {
+                    $contact = $contact_list[0];
+                    WCXS_Utilities::log_sync("Found matching contact in Xero API by email: ID {$contact['ContactID']}, Name: {$contact['Name']}", null);
+                    return $contact;
                 }
+                
+                WCXS_Utilities::log_sync("No matching contact found in Xero API", null);
+            } else {
+                WCXS_Utilities::log_sync("No contacts returned from Xero API for email: $email", null);
             }
             
             return null;
             
         } catch (Exception $e) {
-            $this->log_error('Failed to find existing contact: ' . $e->getMessage());
+            WCXS_Utilities::log_error('Failed to find existing contact: ' . $e->getMessage());
             return null;
         }
     }
@@ -437,6 +396,8 @@ class WooCiviXeroSync {
                 civicrm_initialize();
             }
             
+            WCXS_Utilities::log_sync("Searching for CiviCRM contact with email: {$email}", null);
+            
             // Get contact ID from email
             $contact_result = civicrm_api3('Contact', 'get', array(
                 'sequential' => 1,
@@ -445,10 +406,12 @@ class WooCiviXeroSync {
             ));
             
             if ($contact_result['is_error'] || empty($contact_result['values'])) {
+                WCXS_Utilities::log_sync("No CiviCRM contact found with email: {$email}", null);
                 return null;
             }
             
             $contact_id = $contact_result['values'][0]['id'];
+            WCXS_Utilities::log_sync("Found CiviCRM contact ID: {$contact_id} for email: {$email}", null);
             
             // Check if contact exists in account_contact table
             $account_contact_result = civicrm_api3('AccountContact', 'get', array(
@@ -459,20 +422,37 @@ class WooCiviXeroSync {
             ));
             
             if ($account_contact_result['is_error'] || empty($account_contact_result['values'])) {
+                WCXS_Utilities::log_sync("No account_contact record found for CiviCRM contact ID: {$contact_id}", null);
                 return null;
             }
             
             $account_contact = $account_contact_result['values'][0];
             
+            // Check if accounts_contact_id key exists
+            if (!isset($account_contact['accounts_contact_id'])) {
+                WCXS_Utilities::log_sync("Found account_contact record but accounts_contact_id key is missing for CiviCRM contact ID: {$contact_id}", null);
+                return null;
+            }
+            
+            $xero_contact_id = $account_contact['accounts_contact_id'];
+            
+            // Validate that the Xero contact ID is not empty
+            if (empty($xero_contact_id)) {
+                WCXS_Utilities::log_sync("Found account_contact record but Xero contact ID is empty for CiviCRM contact ID: {$contact_id}", null);
+                return null;
+            }
+            
+            WCXS_Utilities::log_sync("Found Xero contact ID: {$xero_contact_id} in account_contact table for CiviCRM contact ID: {$contact_id}", null);
+            
             // Return contact data in Xero format
             return array(
-                'ContactID' => $account_contact['accounts_contact_id'],
+                'ContactID' => $xero_contact_id,
                 'EmailAddress' => $email,
                 'found_in_account_table' => true
             );
             
         } catch (Exception $e) {
-            $this->log_error('Failed to find contact in account table: ' . $e->getMessage());
+            WCXS_Utilities::log_error('Failed to find contact in account table: ' . $e->getMessage());
             return null;
         }
     }
@@ -484,15 +464,21 @@ class WooCiviXeroSync {
      */
     private function create_xero_contact($xero_api, $contact_data) {
         try {
-            $result = $xero_api->contacts(array($contact_data));
+            WCXS_Utilities::log_sync("Creating new Xero contact: {$contact_data['Name']}", null);
             
-            if (isset($result['Contacts']['Contact'])) {
-                return $result['Contacts']['Contact'];
+            // Use the utilities method for consistency
+            $result = WCXS_Utilities::create_xero_contact($xero_api, $contact_data);
+            
+            // Validate the result
+            if ($result && isset($result['ContactID']) && isset($result['Name'])) {
+                WCXS_Utilities::log_sync("Successfully created Xero contact: ID {$result['ContactID']}, Name: {$result['Name']}", null);
+                return $result;
+            } else {
+                WCXS_Utilities::log_error("Invalid response from Xero API when creating contact", null);
+                throw new Exception('Invalid response from Xero API when creating contact');
             }
-            
-            throw new Exception('Invalid response from Xero API');
-            
         } catch (Exception $e) {
+            WCXS_Utilities::log_error("Failed to create Xero contact: {$contact_data['Name']} - " . $e->getMessage());
             throw new Exception('Failed to create contact in Xero: ' . $e->getMessage());
         }
     }
@@ -502,19 +488,141 @@ class WooCiviXeroSync {
      */
     private function update_xero_contact($xero_api, $contact_id, $contact_data) {
         try {
-            // Add contact ID for update
-            $contact_data['ContactID'] = $contact_id;
+            WCXS_Utilities::log_sync("Updating existing Xero contact: ID {$contact_id}, Name: {$contact_data['Name']}", null);
             
-            $result = $xero_api->contacts(array($contact_data));
+            // Use the utilities method for consistency
+            $result = WCXS_Utilities::update_xero_contact($xero_api, $contact_id, $contact_data);
             
-            if (isset($result['Contacts']['Contact'])) {
-                return $result['Contacts']['Contact'];
+            // Validate the result
+            if ($result && isset($result['ContactID']) && isset($result['Name'])) {
+                WCXS_Utilities::log_sync("Successfully updated Xero contact: ID {$result['ContactID']}, Name: {$result['Name']}", null);
+                return $result;
+            } else {
+                WCXS_Utilities::log_error("Invalid response from Xero API when updating contact", null);
+                throw new Exception('Invalid response from Xero API when updating contact');
+            }
+        } catch (Exception $e) {
+            WCXS_Utilities::log_error("Failed to update Xero contact: ID {$contact_id} - " . $e->getMessage());
+            throw new Exception('Failed to update contact in Xero: ' . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Ensure account_contact record exists for the given CiviCRM contact and Xero contact
+     */
+    private function ensure_account_contact_exists($civicrm_contact_id, $xero_contact_id, $xero_contact_name) {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
             }
             
-            throw new Exception('Invalid response from Xero API');
+            WCXS_Utilities::log_sync("Checking if account_contact record exists for CiviCRM contact ID: {$civicrm_contact_id} with Xero contact ID: {$xero_contact_id}", null);
+            
+            // Check if account_contact record already exists for this CiviCRM contact
+            $existing_result = civicrm_api3('AccountContact', 'get', array(
+                'sequential' => 1,
+                'contact_id' => $civicrm_contact_id,
+                'plugin' => 'xero',
+                'return' => array('id', 'accounts_contact_id')
+            ));
+            
+            if ($existing_result['is_error']) {
+                WCXS_Utilities::log_error("Failed to check existing account_contact record: " . $existing_result['error_message']);
+                return false;
+            }
+            
+            // If no record exists, create one
+            if (empty($existing_result['values'])) {
+                WCXS_Utilities::log_sync("No account_contact record found, creating new one", null);
+                return $this->update_account_contact_table($civicrm_contact_id, $xero_contact_id, $xero_contact_name);
+            }
+            
+            // If record exists but has different Xero contact ID, update it
+            $existing_record = $existing_result['values'][0];
+            
+            // Check if accounts_contact_id key exists
+            if (!isset($existing_record['accounts_contact_id'])) {
+                WCXS_Utilities::log_sync("Account_contact record exists but accounts_contact_id key is missing, updating", null);
+                return $this->update_account_contact_table($civicrm_contact_id, $xero_contact_id, $xero_contact_name);
+            }
+            
+            if (empty($existing_record['accounts_contact_id']) || $existing_record['accounts_contact_id'] !== $xero_contact_id) {
+                WCXS_Utilities::log_sync("Account_contact record exists but Xero contact ID is different or empty, updating", null);
+                return $this->update_account_contact_table($civicrm_contact_id, $xero_contact_id, $xero_contact_name);
+            }
+            
+            // Record already exists and matches
+            WCXS_Utilities::log_sync("Account_contact record already exists and matches Xero contact ID", null);
+            return true;
             
         } catch (Exception $e) {
-            throw new Exception('Failed to update contact in Xero: ' . $e->getMessage());
+            WCXS_Utilities::log_error("Failed to ensure account_contact exists: " . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Update account_contact table with Xero contact information
+     */
+    private function update_account_contact_table($civicrm_contact_id, $xero_contact_id, $xero_contact_name) {
+        try {
+            // Initialize CiviCRM if needed
+            if (!defined('CIVICRM_UF')) {
+                civicrm_initialize();
+            }
+            
+            WCXS_Utilities::log_sync("Updating account_contact table for CiviCRM contact ID: {$civicrm_contact_id} with Xero contact ID: {$xero_contact_id}", null);
+            
+            // Check if account_contact record already exists
+            $existing_result = civicrm_api3('AccountContact', 'get', array(
+                'sequential' => 1,
+                'contact_id' => $civicrm_contact_id,
+                'plugin' => 'xero',
+                'return' => array('id')
+            ));
+            
+            if ($existing_result['is_error']) {
+                WCXS_Utilities::log_error("Failed to check existing account_contact record: " . $existing_result['error_message']);
+                return false;
+            }
+            
+            $account_contact_data = array(
+                'contact_id' => $civicrm_contact_id,
+                'plugin' => 'xero',
+                'connector_id' => 0, // Default connector ID
+                'accounts_contact_id' => $xero_contact_id,
+                'accounts_display_name' => $xero_contact_name,
+                'accounts_modified_date' => current_time('Y-m-d H:i:s'),
+                'accounts_needs_update' => FALSE,
+                'accounts_data' => json_encode(array(
+                    'ContactID' => $xero_contact_id,
+                    'Name' => $xero_contact_name
+                ))
+            );
+            
+            if (!empty($existing_result['values'])) {
+                // Update existing record
+                $account_contact_data['id'] = $existing_result['values'][0]['id'];
+                $result = civicrm_api3('AccountContact', 'update', $account_contact_data);
+                WCXS_Utilities::log_sync("Updated existing account_contact record ID: {$existing_result['values'][0]['id']}", null);
+            } else {
+                // Create new record
+                $result = civicrm_api3('AccountContact', 'create', $account_contact_data);
+                WCXS_Utilities::log_sync("Created new account_contact record ID: {$result['id']}", null);
+            }
+            
+            if ($result['is_error']) {
+                WCXS_Utilities::log_error("Failed to update account_contact table: " . $result['error_message']);
+                return false;
+            }
+            
+            WCXS_Utilities::log_sync("Successfully updated account_contact table for CiviCRM contact ID: {$civicrm_contact_id}", null);
+            return true;
+            
+        } catch (Exception $e) {
+            WCXS_Utilities::log_error("Failed to update account_contact table: " . $e->getMessage());
+            return false;
         }
     }
     
@@ -578,6 +686,16 @@ class WooCiviXeroSync {
             'woo-civi-xero-sync',
             array($this, 'admin_page')
         );
+        
+        // Add debug page
+        add_submenu_page(
+            'woocommerce',
+            __('Xero Sync Debug', 'woo-civi-xero-sync'),
+            __('Xero Sync Debug', 'woo-civi-xero-sync'),
+            'manage_woocommerce',
+            'woo-civi-xero-sync-debug',
+            array($this, 'debug_page')
+        );
     }
     
     /**
@@ -595,29 +713,60 @@ class WooCiviXeroSync {
     }
     
     /**
+     * Debug page
+     */
+    public function debug_page() {
+        include WCXS_PLUGIN_DIR . 'admin/debug-page.php';
+        $debug_page = new WooCiviXeroSyncDebugPage();
+        $debug_page->render();
+    }
+    
+    /**
      * AJAX handler for testing Xero connection
      */
     public function ajax_test_connection() {
-        check_ajax_referer('wcxs_test_connection', 'nonce');
+        // Log the AJAX request for debugging
+        error_log('WCXS: Test connection AJAX request received');
+        
+        try {
+            check_ajax_referer('wcxs_test_connection', 'nonce');
+        } catch (Exception $e) {
+            error_log('WCXS: Nonce verification failed: ' . $e->getMessage());
+            wp_send_json_error(array('message' => 'Security check failed: ' . $e->getMessage()));
+            return;
+        }
         
         if (!current_user_can('manage_woocommerce')) {
+            error_log('WCXS: User does not have required permissions');
             wp_die(__('You do not have permission to perform this action.', 'woo-civi-xero-sync'));
         }
         
         try {
+            error_log('WCXS: Starting test connection process');
+            
             // First, let's debug the settings
-            $settings = $this->get_civicrm_xero_settings();
+            error_log('WCXS: Attempting to get CiviCRM Xero settings');
+            $settings = WCXS_Utilities::get_civicrm_xero_settings();
             if (!$settings) {
+                error_log('WCXS: Failed to retrieve CiviCRM Xero settings');
+                WCXS_Utilities::log_error('Test connection failed: Could not retrieve CiviCRM Xero settings');
                 wp_send_json_error(array('message' => __('Failed to retrieve CiviCRM Xero settings. Check the error logs for details.', 'woo-civi-xero-sync')));
             }
             
-            $xero_api = $this->get_xero_api();
+            WCXS_Utilities::log_sync('Test connection: Retrieved CiviCRM Xero settings successfully', null);
+            
+            $xero_api = WCXS_Utilities::get_xero_api();
             if (!$xero_api) {
+                WCXS_Utilities::log_error('Test connection failed: Could not initialize Xero API');
                 wp_send_json_error(array('message' => __('Failed to initialize Xero API.', 'woo-civi-xero-sync')));
             }
             
+            WCXS_Utilities::log_sync('Test connection: Initialized Xero API successfully', null);
+            
             // Test connection by getting organization info
             $org_info = $xero_api->organisation();
+            
+            WCXS_Utilities::log_sync('Test connection: Retrieved organization info from Xero', null);
             
             if (isset($org_info['Organisations']['Organisation'])) {
                 $org = $org_info['Organisations']['Organisation'];
@@ -625,12 +774,17 @@ class WooCiviXeroSync {
                     __('Successfully connected to Xero organization: %s', 'woo-civi-xero-sync'),
                     $org['Name'] ?? 'Unknown'
                 );
+                WCXS_Utilities::log_sync('Test connection: Successfully connected to Xero organization: ' . ($org['Name'] ?? 'Unknown'), null);
                 wp_send_json_success(array('message' => $message));
             } else {
+                WCXS_Utilities::log_error('Test connection failed: Connected to Xero but could not retrieve organization information');
                 wp_send_json_error(array('message' => __('Connected to Xero but could not retrieve organization information.', 'woo-civi-xero-sync')));
             }
             
         } catch (Exception $e) {
+            error_log('WCXS: Test connection exception: ' . $e->getMessage());
+            error_log('WCXS: Exception trace: ' . $e->getTraceAsString());
+            WCXS_Utilities::log_error('Test connection failed: ' . $e->getMessage());
             wp_send_json_error(array('message' => $e->getMessage()));
         }
     }
@@ -730,6 +884,7 @@ class WooCiviXeroSync {
         }
     }
     
+   
     /**
      * Plugin activation
      */
@@ -745,6 +900,169 @@ class WooCiviXeroSync {
      */
     public function deactivate() {
         // Clean up if needed
+    }
+    
+    /**
+     * AJAX handler for getting invoice details
+     */
+    public function ajax_get_invoice_details() {
+        try {
+            error_log("WCXS Debug: AJAX invoice details request received");
+            error_log("WCXS Debug: POST data: " . json_encode($_POST));
+            
+            // Verify nonce
+            if (!wp_verify_nonce($_POST['nonce'], 'wcxs_invoice_details')) {
+                error_log("WCXS Debug: Nonce verification failed");
+                wp_send_json_error(array('message' => 'Security check failed'));
+                return;
+            }
+            
+            // Check permissions
+            if (!current_user_can('manage_woocommerce')) {
+                error_log("WCXS Debug: Permission check failed");
+                wp_send_json_error(array('message' => 'Insufficient permissions'));
+                return;
+            }
+            
+            $invoice_id = sanitize_text_field($_POST['invoice_id']);
+            $invoice_number = sanitize_text_field($_POST['invoice_number']);
+            
+            error_log("WCXS Debug: Invoice ID: $invoice_id, Invoice Number: $invoice_number");
+            
+            if (empty($invoice_id)) {
+                error_log("WCXS Debug: Invoice ID is empty");
+                wp_send_json_error(array('message' => 'Invoice ID is required'));
+                return;
+            }
+            
+            // Get invoice details from Xero
+            error_log("WCXS Debug: Calling get_invoice_details");
+            $invoice_details = $this->get_invoice_details($invoice_id);
+            
+            error_log("WCXS Debug: Invoice details result: " . ($invoice_details ? 'success' : 'null'));
+            
+            if ($invoice_details) {
+                error_log("WCXS Debug: Rendering invoice HTML");
+                $html = $this->render_invoice_details_html($invoice_details);
+                error_log("WCXS Debug: HTML length: " . strlen($html));
+                wp_send_json_success(array('html' => $html));
+            } else {
+                error_log("WCXS Debug: Failed to retrieve invoice details");
+                wp_send_json_error(array('message' => 'Failed to retrieve invoice details'));
+            }
+            
+        } catch (Exception $e) {
+            error_log("WCXS Debug: Exception in AJAX handler: " . $e->getMessage());
+            wp_send_json_error(array('message' => $e->getMessage()));
+        }
+    }
+    
+    /**
+     * Get detailed invoice information from Xero using direct method only
+     */
+    private function get_invoice_details($invoice_id) {
+        try {
+            error_log("WCXS Debug: get_invoice_details called with ID: $invoice_id");
+            
+            $xero_api = WCXS_Utilities::get_xero_api();
+            if (!$xero_api) {
+                error_log("WCXS Debug: Failed to get Xero API");
+                return null;
+            }
+            
+            error_log("WCXS Debug: Using direct invoice ID method");
+            
+            // Use direct method only
+            $invoice = $xero_api->invoices($invoice_id);
+            error_log("WCXS Debug: Direct method result: " . json_encode($invoice));
+            
+            if (!$invoice || !is_array($invoice)) {
+                error_log("WCXS Debug: Direct method returned null or not array");
+                return null;
+            }
+            
+            error_log("WCXS Debug: Successfully retrieved invoice");
+            return $invoice;
+            
+        } catch (Exception $e) {
+            error_log("WCXS Debug: Exception getting invoice details: " . $e->getMessage());
+            return null;
+        }
+    }
+    
+    /**
+     * Render invoice details as HTML
+     */
+    private function render_invoice_details_html($invoice) {
+        $html = '';
+        
+        if (isset($invoice['Invoices']['Invoice'])) {
+            $invoice_data = $invoice['Invoices']['Invoice'];
+            if (!isset($invoice_data[0])) {
+                $invoice_data = array($invoice_data);
+            }
+            $invoice_data = $invoice_data[0]; // Get the first invoice
+            
+            $html .= '<h5>Complete Invoice Information:</h5>';
+            
+            // Invoice Details
+            $html .= '<table class="wcxs-info-table">';
+            $html .= '<tr><th>Field</th><th>Value</th></tr>';
+            $html .= '<tr><td>Invoice ID</td><td>' . esc_html($invoice_data['InvoiceID']) . '</td></tr>';
+            $html .= '<tr><td>Invoice Number</td><td>' . esc_html($invoice_data['InvoiceNumber']) . '</td></tr>';
+            $html .= '<tr><td>Date</td><td>' . esc_html($invoice_data['Date']) . '</td></tr>';
+            $html .= '<tr><td>Due Date</td><td>' . esc_html($invoice_data['DueDate']) . '</td></tr>';
+            $html .= '<tr><td>Status</td><td>' . esc_html($invoice_data['Status']) . '</td></tr>';
+            $html .= '<tr><td>Type</td><td>' . esc_html($invoice_data['Type']) . '</td></tr>';
+            $html .= '<tr><td>Sub Total</td><td>' . esc_html($invoice_data['SubTotal']) . '</td></tr>';
+            $html .= '<tr><td>Total Tax</td><td>' . esc_html($invoice_data['TotalTax']) . '</td></tr>';
+            $html .= '<tr><td>Total</td><td>' . esc_html($invoice_data['Total']) . '</td></tr>';
+            $html .= '<tr><td>Amount Due</td><td>' . esc_html($invoice_data['AmountDue']) . '</td></tr>';
+            $html .= '<tr><td>Amount Paid</td><td>' . esc_html($invoice_data['AmountPaid']) . '</td></tr>';
+            $html .= '<tr><td>Currency Code</td><td>' . esc_html($invoice_data['CurrencyCode']) . '</td></tr>';
+            $html .= '</table>';
+            
+            // Contact Information
+            if (isset($invoice_data['Contact'])) {
+                $html .= '<h5>Contact Information:</h5>';
+                $html .= '<table class="wcxs-info-table">';
+                $html .= '<tr><th>Field</th><th>Value</th></tr>';
+                $html .= '<tr><td>Contact ID</td><td>' . esc_html($invoice_data['Contact']['ContactID']) . '</td></tr>';
+                $html .= '<tr><td>Name</td><td>' . esc_html($invoice_data['Contact']['Name']) . '</td></tr>';
+                $html .= '</table>';
+            }
+           
+            
+            // Line Items
+            if (isset($invoice_data['LineItems']['LineItem'])) {
+                $html .= '<h5>Line Items:</h5>';
+                $html .= '<table class="wcxs-info-table">';
+                $html .= '<tr><th>Description</th><th>Quantity</th><th>Unit Amount</th><th>Line Amount</th><th>Tax Amount</th><th>Tax Type</th><th>Account Code</th></tr>';
+                
+                $line_items = $invoice_data['LineItems']['LineItem'];
+                if (!isset($line_items[0])) {
+                    $line_items = array($line_items);
+                }
+                
+                foreach ($line_items as $line_item) {
+                    $html .= '<tr>';
+                    $html .= '<td>' . esc_html($line_item['Description'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['Quantity'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['UnitAmount'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['LineAmount'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['TaxAmount'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['TaxType'] ?? 'N/A') . '</td>';
+                    $html .= '<td>' . esc_html($line_item['AccountCode'] ?? 'N/A') . '</td>';
+                    $html .= '</tr>';
+                }
+                $html .= '</table>';
+            }
+            
+        } else {
+            $html = '<div class="wcxs-error">No invoice data found</div>';
+        }
+        
+        return $html;
     }
 }
 

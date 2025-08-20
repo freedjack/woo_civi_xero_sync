@@ -131,6 +131,13 @@ class WooCiviXeroSync {
      * Handle order status change
      */
     public function handle_order_status_change($order_id, $old_status, $new_status, $order) {
+        // Check if sync is enabled
+        $enable_sync = get_option('wcxs_enable_sync', true);
+        if (!$enable_sync) {
+            WCXS_Utilities::log_sync("Sync disabled - skipping contact sync for Order #{$order_id}", $order_id);
+            return;
+        }
+        
         // Sync contact to Xero as soon as order is submitted
         $this->sync_contact_to_xero($order);
     }
@@ -703,6 +710,7 @@ class WooCiviXeroSync {
      */
     public function init_settings() {
         register_setting('wcxs_settings', 'wcxs_enable_logging');
+        register_setting('wcxs_settings', 'wcxs_enable_sync');
     }
     
     /**
@@ -892,6 +900,9 @@ class WooCiviXeroSync {
         // Set default options
         if (!get_option('wcxs_enable_logging')) {
             update_option('wcxs_enable_logging', true);
+        }
+        if (!get_option('wcxs_enable_sync')) {
+            update_option('wcxs_enable_sync', true);
         }
     }
     

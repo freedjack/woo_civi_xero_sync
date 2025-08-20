@@ -7,10 +7,12 @@ if (!defined('ABSPATH')) {
 // Handle form submissions
 if (isset($_POST['submit'])) {
     update_option('wcxs_enable_logging', isset($_POST['enable_logging']) ? true : false);
+    update_option('wcxs_enable_sync', isset($_POST['enable_sync']) ? true : false);
     echo '<div class="notice notice-success"><p>' . __('Settings saved successfully!', 'woo-civi-xero-sync') . '</p></div>';
 }
 
 $enable_logging = get_option('wcxs_enable_logging', true);
+$enable_sync = get_option('wcxs_enable_sync', true);
 $logs = get_option('wcxs_sync_logs', array());
 ?>
 
@@ -38,6 +40,21 @@ $logs = get_option('wcxs_sync_logs', array());
                         </label>
                         <p class="description">
                             <?php _e('When enabled, all sync activities and errors will be logged for debugging purposes.', 'woo-civi-xero-sync'); ?>
+                        </p>
+                    </td>
+                </tr>
+                
+                <tr>
+                    <th scope="row">
+                        <label for="enable_sync"><?php _e('Enable Xero Contact Address on Submission', 'woo-civi-xero-sync'); ?></label>
+                    </th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="enable_sync" value="1" <?php echo $enable_sync ? 'checked' : ''; ?>>
+                            <?php _e('Sync WooCommerce order contact to Xero on order submission', 'woo-civi-xero-sync'); ?>
+                        </label>
+                        <p class="description">
+                            <?php _e('When enabled, the plugin will automatically update or create Xero contacts with WooCommerce billing information when an order is submitted. When disabled, no sync will occur.', 'woo-civi-xero-sync'); ?>
                         </p>
                     </td>
                 </tr>

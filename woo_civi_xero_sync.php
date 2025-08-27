@@ -62,8 +62,9 @@ class WooCiviXeroSync {
      * Initialize hooks
      */
     private function init_hooks() {
-        // Check if CiviCRM and WooCommerce are active
+        // Check if CiviCRM and WooCommerce are active - delay CiviCRM init to avoid rewrite issues
         add_action('plugins_loaded', array($this, 'check_dependencies'));
+        add_action('init', array($this, 'init_civicrm'), 20);
         
         // Hook into WooCommerce order status changes
         add_action('woocommerce_order_status_changed', array($this, 'handle_order_status_change'), 10, 4);
@@ -100,6 +101,15 @@ class WooCiviXeroSync {
         
         if (!function_exists('civicrm_initialize')) {
             add_action('admin_notices', array($this, 'civicrm_missing_notice'));
+            return;
+        }
+    }
+    
+    /**
+     * Initialize CiviCRM after WordPress is fully loaded
+     */
+    public function init_civicrm() {
+        if (!function_exists('civicrm_initialize')) {
             return;
         }
         
